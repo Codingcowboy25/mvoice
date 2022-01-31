@@ -38,6 +38,21 @@ CAudioManager::CAudioManager() : hot_mic(false), play_file(false), m17_sid_in(0U
 {
 	link_open = true;
 	volStats.count = 0;
+
+	expand.data_in = expand_in;
+	expand.data_out = expand_out;
+	expand.input_frames = 160;
+	expand.output_frames = 882;
+	expand.end_of_input = false;
+	RSExpand.SetRatio(expand, 44100.0/8000.0);
+
+	shrink.data_in = shrink_in;
+	shrink.data_out = expand_out;
+	shrink.input_frames = 882;
+	shrink.output_frames = 160;
+	shrink.end_of_input = false;
+	RSShrink.SetRatio(shrink, 8000.0/44100.0);
+
 }
 
 bool CAudioManager::Init(CMainWindow *pMain)
@@ -238,10 +253,10 @@ void CAudioManager::microphone2audioqueue()
 	snd_pcm_hw_params_set_channels(handle, params, 1);
 
 	// 8000 samples/second
-	snd_pcm_hw_params_set_rate(handle, params, 8000, 0);
+	snd_pcm_hw_params_set_rate(handle, params, 44100, 0);
 
-	// Set period size to 40 ms for M17, 20 ms for AMBE.
-	snd_pcm_uframes_t frames = 160;
+	// Set period size to 20 ms.
+	snd_pcm_uframes_t frames = shrink.input_frames;
 	snd_pcm_hw_params_set_period_size(handle, params, frames, 0);
 
 	// Write the parameters to the driver
@@ -253,7 +268,7 @@ void CAudioManager::microphone2audioqueue()
 
 	bool keep_running;
 	do {
-		short int audio_buffer[frames];
+		short int audio_buffer[frames], audio_frame[160];
 		rc = snd_pcm_readi(handle, audio_buffer, frames);
 		if (rc == -EPIPE) {
 			// EPIPE means overrun
@@ -261,16 +276,22 @@ void CAudioManager::microphone2audioqueue()
 			snd_pcm_prepare(handle);
 		} else if (rc < 0) {
 			std::cerr << "error from readi: " << snd_strerror(rc) << std::endl;
-		} else if (rc != int(frames)) {
+		} else if (rc != int(shrink.input_frames)) {
 			std::cerr << "short readi, read " << rc << " frames" << std::endl;
 		}
+
 		keep_running = hot_mic;
-		CAudioFrame frame(audio_buffer);
+		RSShrink.Short2Float(audio_buffer, shrink.data_in, shrink.input_frames);
+		if (RSShrink.Process(shrink))
+			keep_running = hot_mic = false;
+		RSShrink.Float2Short(shrink.data_out, audio_frame, shrink.output_frames);
+		CAudioFrame frame(audio_frame);
 		frame.SetFlag(! keep_running);
 		audio_mutex.lock();
 		audio_queue.Push(frame);
 		audio_mutex.unlock();
 	} while (keep_running);
+	RSShrink.Reset();
 	snd_pcm_drop(handle);
 	snd_pcm_close(handle);
 }
@@ -394,10 +415,10 @@ void CAudioManager::play_audio_queue()
 	snd_pcm_hw_params_set_channels(handle, params, 1);
 
 	// samples/second sampling rate
-	snd_pcm_hw_params_set_rate(handle, params, 8000, 0);
+	snd_pcm_hw_params_set_rate(handle, params, 44100, 0);
 
 	// Set period size to 160 frames.
-	snd_pcm_uframes_t frames = 160;
+	snd_pcm_uframes_t frames = expand.input_frames;
 	snd_pcm_hw_params_set_period_size(handle, params, frames, 0);
 	//snd_pcm_hw_params_set_period_size_near(handle, params, &frames, &dir);
 
@@ -413,26 +434,32 @@ void CAudioManager::play_audio_queue()
 
 	bool last;
 	do {
+		short short_out[882];
 		while (audio_is_empty())
 			std::this_thread::sleep_for(std::chrono::milliseconds(3));
 		audio_mutex.lock();
 		CAudioFrame frame(audio_queue.Pop());
 		audio_mutex.unlock();
 		last = frame.GetFlag();
-		rc = snd_pcm_writei(handle, frame.GetData(), frames);
+		RSExpand.Short2Float(frame.GetData(), expand.data_in, expand.input_frames);
+		if (RSExpand.Process(expand))
+			last = true;
+		RSExpand.Float2Short(expand.data_out, short_out, expand.output_frames);
+		rc = snd_pcm_writei(handle, short_out, expand.output_frames);
 		if (rc == -EPIPE) {
 			// EPIPE means underrun
 			// std::cerr << "underrun occurred" << std::endl;
 			snd_pcm_prepare(handle);
 		} else if (rc < 0) {
 			std::cerr <<  "error from writei: " << snd_strerror(rc) << std::endl;
-		}  else if (rc != int(frames)) {
+		}  else if (rc != int(expand.output_frames)) {
 			std::cerr << "short write, write " << rc << " frames" << std::endl;
 		}
 	} while (! last);
 
 	snd_pcm_drain(handle);
 	snd_pcm_close(handle);
+	RSExpand.Reset();
 }
 
 bool CAudioManager::audio_is_empty()
